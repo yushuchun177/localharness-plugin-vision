@@ -68,17 +68,29 @@ func _ocr(args: Dictionary) -> Dictionary:
 
 	var out_file := OS.get_temp_dir().path_join("lh_ocr_%d.txt" % randi())
 	var ps_file := OS.get_temp_dir().path_join("lh_ocr_%d.ps1" % randi())
-	var script := _ocr_script(path, lang, out_file)
+	# Windows OCR 对小字识别很差，图太小就先放大两倍再识别
+	var ocr_src := path
+	var img := Image.new()
+	if img.load(path) == OK and img.get_width() < 900:
+		img.resize(img.get_width() * 2, img.get_height() * 2, Image.INTERPOLATE_BILINEAR)
+		ocr_src = OS.get_temp_dir().path_join("lh_ocr_up_%d.png" % randi())
+		img.save_png(ocr_src)
+	var win_path := ocr_src.replace("/", "\\")
+	var script := _ocr_script(win_path, lang, out_file)
 	var f := FileAccess.open(ps_file, FileAccess.WRITE)
 	if f == null:
 		return {"ok": false, "output": "写临时脚本失败"}
-	f.store_string(script)
+	# PowerShell 5.1 会把无 BOM 的 .ps1 当 ANSI 读，反引号和引号会被弄坏；
+	# 所以写成 UTF-16LE + BOM（和记事本"Unicode"一致），WinRT 桥接才能跑。
+	f.store_buffer(PackedByteArray([0xFF, 0xFE]))
+	f.store_buffer(script.to_utf16_buffer())
 	f.close()
 
 	var out: Array = []
 	var code := OS.execute("powershell.exe", PackedStringArray([
 		"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ps_file]), out, true)
-	DirAccess.remove_absolute(ps_file)
+	if code == 0:
+		DirAccess.remove_absolute(ps_file)
 
 	var text := ""
 	if FileAccess.file_exists(out_file):
@@ -86,23 +98,27 @@ func _ocr(args: Dictionary) -> Dictionary:
 		if rf:
 			text = rf.get_as_text()
 		DirAccess.remove_absolute(out_file)
+	# 保留脚本路径方便排查（失败时提示里会带上）
 	if code != 0 and text.strip_edges() == "":
-		var msg := "OCR 失败（PowerShell 退出码 %d）" % code
+		var msg := "OCR 失败（PowerShell 退出码 %d，脚本 %s）" % [code, ps_file]
 		if out.size() > 0 and str(out[0]).strip_edges() != "":
 			msg += "：" + str(out[0]).strip_edges().substr(0, 300)
 		return {"ok": false, "output": msg}
 	if text.strip_edges() == "":
 		return {"ok": true, "output": "（这张图里没识别出文字）"}
+	if text.begins_with("ERR:"):
+		return {"ok": false, "output": "OCR 失败：" + text.substr(4).strip_edges()}
 	return {"ok": true, "output": "OCR 结果：\n" + text.strip_edges()}
 
 
 func _ocr_script(image: String, lang: String, out_file: String) -> String:
-	# PowerShell 5.1 调 WinRT 的固定套路：先拿 AsTask 泛型方法做 await 桥接
+	# 注意：PowerShell 5.1 里 WinRT 的 await 桥接要逐个显式指定类型，
+	# 包成泛型函数传 Type 容易在 MakeGenericMethod 处炸，这里全部内联。
 	var lang_line := ""
 	if lang != "":
 		lang_line = """
-$lang = [Windows.Globalization.Language]::new('%s')
-$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($lang)
+$langObj = [Windows.Globalization.Language]::new('%s')
+$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($langObj)
 if (-not $engine) { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages() }
 """ % lang.replace("'", "''")
 	else:
@@ -110,31 +126,54 @@ if (-not $engine) { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserPr
 
 	return """
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+try {
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
     $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
     $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
-function Await($op, $t) {
-    $m = $asTaskGeneric.MakeGenericMethod($t)
-    $task = $m.Invoke($null, @($op))
-    $task.Wait(-1) | Out-Null
-    $task.Result
-}
 [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime] | Out-Null
 [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics, ContentType = WindowsRuntime] | Out-Null
 [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime] | Out-Null
 
-$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync('IMAGE_PATH')) ([Windows.Storage.StorageFile])
-$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
-$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+$op1 = [Windows.Storage.StorageFile]::GetFileFromPathAsync('IMAGE_PATH')
+$t1 = $asTaskGeneric.MakeGenericMethod([Windows.Storage.StorageFile]).Invoke($null, @($op1))
+$t1.Wait(-1) | Out-Null
+$file = $t1.Result
+
+$op2 = $file.OpenAsync([Windows.Storage.FileAccessMode]::Read)
+$t2 = $asTaskGeneric.MakeGenericMethod([Windows.Storage.Streams.IRandomAccessStream]).Invoke($null, @($op2))
+$t2.Wait(-1) | Out-Null
+$stream = $t2.Result
+
+$op3 = [Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)
+$t3 = $asTaskGeneric.MakeGenericMethod([Windows.Graphics.Imaging.BitmapDecoder]).Invoke($null, @($op3))
+$t3.Wait(-1) | Out-Null
+$decoder = $t3.Result
+
+$op4 = $decoder.GetSoftwareBitmapAsync()
+$t4 = $asTaskGeneric.MakeGenericMethod([Windows.Graphics.Imaging.SoftwareBitmap]).Invoke($null, @($op4))
+$t4.Wait(-1) | Out-Null
+$bitmap = $t4.Result
+
 LANG_LINE
-if (-not $engine) { throw 'no OCR engine (no language pack)' }
-$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+if (-not $engine) { throw 'no OCR engine (no language pack installed)' }
+$op5 = $engine.RecognizeAsync($bitmap)
+$t5 = $asTaskGeneric.MakeGenericMethod([Windows.Media.Ocr.OcrResult]).Invoke($null, @($op5))
+$t5.Wait(-1) | Out-Null
+$result = $t5.Result
+
 $sb = New-Object System.Text.StringBuilder
 foreach ($line in $result.Lines) { [void]$sb.AppendLine($line.Text) }
 [System.IO.File]::WriteAllText('OUT_FILE', $sb.ToString(), [System.Text.Encoding]::UTF8)
 Write-Output 'ok'
+} catch {
+    $e2 = $_.Exception
+    while ($e2.InnerException) { $e2 = $e2.InnerException }
+    [System.IO.File]::WriteAllText('OUT_FILE', 'ERR: ' + $e2.Message, [System.Text.Encoding]::UTF8)
+    Write-Output ('ERR: ' + $e2.Message)
+    exit 1
+}
 """.replace("IMAGE_PATH", image.replace("'", "''")).replace("LANG_LINE", lang_line).replace("OUT_FILE", out_file.replace("'", "''"))
 
 
@@ -257,3 +296,6 @@ func _post_chat(body: String) -> String:
 			if typeof(content) == TYPE_STRING:
 				return str(content).strip_edges()
 	return ""
+
+
+
