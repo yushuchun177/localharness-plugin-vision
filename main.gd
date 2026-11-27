@@ -19,6 +19,14 @@ func _app() -> Node:
 	return ml.root.get_node_or_null("/root/App") if ml != null else null
 
 
+
+func _pref(key: String, def_value):
+	var ml := Engine.get_main_loop()
+	var prefs = ml.root.get_node_or_null("/root/PluginPrefs") if ml != null else null
+	if prefs == null:
+		return def_value
+	return prefs.get_value("vision", key, def_value)
+
 func run(tool: String, args: Dictionary) -> Dictionary:
 	match tool:
 		"vision_info":
@@ -75,8 +83,9 @@ func _ocr(args: Dictionary) -> Dictionary:
 		img.resize(img.get_width() * 2, img.get_height() * 2, Image.INTERPOLATE_BILINEAR)
 		ocr_src = OS.get_temp_dir().path_join("lh_ocr_up_%d.png" % randi())
 		img.save_png(ocr_src)
+	var lang2: String = lang if lang != "" else str(_pref("ocr_lang", "zh-Hans"))
 	var win_path := ocr_src.replace("/", "\\")
-	var script := _ocr_script(win_path, lang, out_file)
+	var script := _ocr_script(win_path, lang2, out_file)
 	var f := FileAccess.open(ps_file, FileAccess.WRITE)
 	if f == null:
 		return {"ok": false, "output": "写临时脚本失败"}
@@ -117,6 +126,7 @@ func _ocr_script(image: String, lang: String, out_file: String) -> String:
 	var lang_line := ""
 	if lang != "":
 		lang_line = """
+[Windows.Globalization.Language, Windows.Globalization, ContentType = WindowsRuntime] | Out-Null
 $langObj = [Windows.Globalization.Language]::new('%s')
 $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($langObj)
 if (-not $engine) { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages() }
@@ -296,6 +306,8 @@ func _post_chat(body: String) -> String:
 			if typeof(content) == TYPE_STRING:
 				return str(content).strip_edges()
 	return ""
+
+
 
 
 
