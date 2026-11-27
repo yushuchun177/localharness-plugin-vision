@@ -51,7 +51,8 @@
       "needs": [
         "本地文件",
         "系统 OCR"
-      ]
+      ],
+      "async": true
     },
     {
       "name": "vision_describe",
@@ -64,7 +65,8 @@
       "needs": [
         "本地文件",
         "视觉模型"
-      ]
+      ],
+      "async": true
     }
   ]
 }
